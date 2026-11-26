@@ -25,7 +25,7 @@ export BOLNA_API_KEY=your_key
 ```
 
 ## Run
-UI: `streamlit run app.py`
+UI (local, reachable only from this machine): `.venv/bin/streamlit run app.py --server.address localhost`
 CLI: `python bolna_tester.py --agent-id <uuid> --input sample_test_cases.csv --workers 5 [--limit 20] [--resume]`
 
 ## Files
@@ -37,6 +37,14 @@ CLI: `python bolna_tester.py --agent-id <uuid> --input sample_test_cases.csv --w
 ## Demo mode (no API key)
 UI: toggle "Demo mode" in the sidebar. CLI: `python bolna_tester.py --mock --input sample_test_cases.csv`.
 Uses an offline keyword-based fake that returns the documented response shape.
+
+## Hosting (Streamlit Community Cloud, free)
+1. share.streamlit.io → sign in with GitHub → **Create app** → repo `bolna-extraction-tester`, branch `main`, file `app.py`.
+2. Advanced settings → Python 3.12. Deploy.
+3. App settings → **Sharing** → make it private and invite teammates by email (it handles customer transcripts).
+- Each user enters their own Bolna API key in the sidebar. Don't put a shared key in Streamlit secrets: everyone with access could use it.
+- `results/` is on temporary disk there: saved runs disappear on restart/redeploy. Download reports after each run.
+- Keep the tab open during a run; the run lives in your browser session.
 
 ## How scoring works
 - **Accuracy = Correct ÷ Captured.** Captured = calls where Bolna returned a value (blank, `-`, `null`, `None`, `N/A` don't count).
