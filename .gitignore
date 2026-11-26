@@ -1,0 +1,16 @@
+# local environment
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# run outputs contain customer transcripts and Bolna responses
+results/
+mappings/
+
+# old packaged copy of this project
+bolna_extraction_tester.zip
+
+# secrets
+.env
+.streamlit/secrets.toml

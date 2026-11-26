@@ -1,0 +1,4 @@
+test_id,transcript,call_date,expected::Agent Handover Needed,expected::Customer Email,expected::Call Outcome
+tc_001,"Agent: Hi, how can I help? Customer: Can I talk to a real person please? My email is ravi@example.com",2026-11-20T10:00:00Z,Yes,ravi@example.com,follow_up
+tc_002,"Agent: Hello! Customer: I'm interested in the enterprise plan, let's book a demo tomorrow.",,No,,interested
+tc_003,"Agent: Hi there. Customer: Not interested, please don't call again.",,No,,not_interested
