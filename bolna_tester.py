@@ -606,20 +606,32 @@ def _style_sheet(ws, match_col=None):
                     c.fill = green if v else red
 
 
+def _xl_safe(df):
+    """Strip control characters Excel can't store (they occasionally appear in LLM output)."""
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    clean = lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
+    out = df.copy()
+    for c in out.columns:
+        if out[c].dtype == object:
+            out[c] = out[c].map(clean)
+    out.columns = [clean(str(c)) for c in out.columns]
+    return out
+
+
 def save_report(report, out_dir, config=None, df=None, results=None):
     os.makedirs(out_dir, exist_ok=True)
     xlsx = os.path.join(out_dir, "extraction_report.xlsx")
     d = report["detail"]
     with pd.ExcelWriter(xlsx) as w:
-        report["summary"].to_excel(w, sheet_name="Summary", index=False)
+        _xl_safe(report["summary"]).to_excel(w, sheet_name="Summary", index=False)
         if not d.empty:
-            d[d["captured"] & ~d["correct"]].to_excel(w, sheet_name="Wrong", index=False)
-            d[d["scored"] & ~d["captured"]].to_excel(w, sheet_name="Missed", index=False)
-            d.to_excel(w, sheet_name="All comparisons", index=False)
-        report["cases"].to_excel(w, sheet_name="Per transcript", index=False)
+            _xl_safe(d[d["captured"] & ~d["correct"]]).to_excel(w, sheet_name="Wrong", index=False)
+            _xl_safe(d[d["scored"] & ~d["captured"]]).to_excel(w, sheet_name="Missed", index=False)
+            _xl_safe(d).to_excel(w, sheet_name="All comparisons", index=False)
+        _xl_safe(report["cases"]).to_excel(w, sheet_name="Per transcript", index=False)
         if df is not None and results is not None:
-            bolna_output_wide(df, results).to_excel(w, sheet_name="Bolna output", index=False)
-            bolna_output(df, results).to_excel(w, sheet_name="Bolna output (all fields)", index=False)
+            _xl_safe(bolna_output_wide(df, results)).to_excel(w, sheet_name="Bolna output", index=False)
+            _xl_safe(bolna_output(df, results)).to_excel(w, sheet_name="Bolna output (all fields)", index=False)
         if config:
             pd.DataFrame([{"expected": k, "agent_fields": ", ".join(v),
                            "mode": config.get("modes", {}).get(k, "auto")}

@@ -6,6 +6,7 @@ import io
 import json
 import os
 import time
+import zipfile
 from collections import deque
 from datetime import datetime
 
@@ -106,12 +107,38 @@ with st.sidebar:
 
     st.markdown("### 🗂 Previous runs")
     runs = sorted([d for d in os.listdir(RESULTS_DIR)
-                   if os.path.exists(os.path.join(RESULTS_DIR, d, "input.csv"))], reverse=True) \
+                   if os.path.exists(os.path.join(RESULTS_DIR, d, "raw_responses.jsonl"))], reverse=True) \
         if os.path.isdir(RESULTS_DIR) else []
+
+    def run_label(d):
+        rd = os.path.join(RESULTS_DIR, d)
+        try:
+            when = datetime.strptime(d, "%Y%m%d_%H%M%S").strftime("%d %b %Y, %H:%M")
+        except ValueError:
+            when = d
+        try:
+            n = sum(1 for _ in open(os.path.join(rd, "raw_responses.jsonl")))
+        except OSError:
+            n = 0
+        try:
+            agent = json.load(open(os.path.join(rd, "meta.json"))).get("agent_id") or "demo"
+        except (OSError, ValueError):
+            agent = "?"
+        return f"{when} · {n} responses · agent {agent[:8]}"
+
     if runs:
         pick = st.selectbox("Open a saved run", runs, index=None, placeholder="Choose a run…",
-                            format_func=lambda d: datetime.strptime(d, "%Y%m%d_%H%M%S").strftime("%d %b %Y, %H:%M"))
-        if st.button("Open run", disabled=pick is None, width="stretch"):
+                            format_func=run_label)
+        if pick:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for fn in os.listdir(os.path.join(RESULTS_DIR, pick)):
+                    z.write(os.path.join(RESULTS_DIR, pick, fn), f"{pick}/{fn}")
+            st.download_button("⬇️ Download raw run files (zip)", buf.getvalue(), f"bolna_run_{pick}.zip",
+                               width="stretch",
+                               help="Your uploaded file + every Bolna response. Works even if the report fails.")
+        has_input = bool(pick) and os.path.exists(os.path.join(RESULTS_DIR, pick, "input.csv"))
+        if st.button("Open run", disabled=not has_input, width="stretch"):
             rd = os.path.join(RESULTS_DIR, pick)
             st.session_state.update(df=load_cases(os.path.join(rd, "input.csv")),
                                     results=load_raw(os.path.join(rd, "raw_responses.jsonl")),
@@ -249,12 +276,18 @@ st.write("")
 xlsx_key = (run_dir, len(results), len(df))
 if st.session_state.get("xlsx_key") != xlsx_key:
     with st.spinner("Building report…"):
-        with open(save_report(report, run_dir, df=df, results=results), "rb") as f:
-            st.session_state.update(xlsx_bytes=f.read(), xlsx_key=xlsx_key)
-xlsx_bytes = st.session_state["xlsx_bytes"]
+        try:  # a report failure must never hide the results or the other downloads
+            with open(save_report(report, run_dir, df=df, results=results), "rb") as f:
+                st.session_state.update(xlsx_bytes=f.read(), xlsx_key=xlsx_key, xlsx_err=None)
+        except Exception as e:
+            st.session_state.update(xlsx_bytes=None, xlsx_key=xlsx_key, xlsx_err=str(e)[:300])
+xlsx_bytes = st.session_state.get("xlsx_bytes")
+if st.session_state.get("xlsx_err"):
+    st.warning(f"Couldn't build the Excel report ({st.session_state['xlsx_err']}). "
+               "The CSV and raw downloads below still have all the data.", icon="⚠️")
 d1, d2, d3 = st.columns(3)
-d1.download_button("⬇️ Full report (Excel)", xlsx_bytes, "extraction_report.xlsx", type="primary",
-                   width="stretch",
+d1.download_button("⬇️ Full report (Excel)", xlsx_bytes or b"", "extraction_report.xlsx", type="primary",
+                   width="stretch", disabled=not xlsx_bytes,
                    help="Summary, wrong, missed, all comparisons, and everything Bolna extracted.")
 d2.download_button("⬇️ Bolna output (CSV)", bolna_output_wide(df, results).to_csv(index=False).encode("utf-8-sig"),
                    "bolna_output.csv", width="stretch",
