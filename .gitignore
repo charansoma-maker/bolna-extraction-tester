@@ -14,3 +14,7 @@ bolna_extraction_tester.zip
 # secrets
 .env
 .streamlit/secrets.toml
+
+# run data dropped into the project folder
+*.jsonl
+*.xlsx

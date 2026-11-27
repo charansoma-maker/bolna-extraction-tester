@@ -64,6 +64,11 @@ def load_cases(src, filename=None) -> pd.DataFrame:
         exp = pd.json_normalize(df["expected"].apply(lambda x: x if isinstance(x, dict) else {}))
         exp.columns = [EXPECTED_PREFIX + c for c in exp.columns]
         df = pd.concat([df.drop(columns=["expected"]), exp], axis=1)
+    # No `expected::` columns at all? Treat every other column as an expected value
+    # (so a file whose columns are just the extraction names still gets scored).
+    reserved = {"test_id", "transcript", "call_date", "expected"}
+    if not any(str(c).startswith(EXPECTED_PREFIX) for c in df.columns):
+        df = df.rename(columns={c: EXPECTED_PREFIX + str(c) for c in df.columns if c not in reserved})
     if "test_id" not in df.columns:
         df.insert(0, "test_id", [f"case_{i+1:05d}" for i in range(len(df))])
     df["test_id"] = df["test_id"].astype(str)
@@ -212,7 +217,10 @@ def extraction_catalog(results) -> pd.DataFrame:
                 r["objective"] = True
     for r in rows.values():
         t = r.pop("_types")
-        r["type"] = "objective" if r["objective"] else next((k for k, _ in t.most_common() if k != "objective"), "text")
+        # Skipped answers carry no format info (validation is null), so they'd outvote the real type;
+        # use any concrete format seen (timestamp/numeric/...) before falling back to text.
+        r["type"] = "objective" if r["objective"] else next(
+            (k for k, _ in t.most_common() if k not in ("objective", "text")), "text")
     df = pd.DataFrame(list(rows.values()))
     if df.empty:
         return pd.DataFrame(columns=["extraction", "category", "filled", "objective", "type", "examples"])

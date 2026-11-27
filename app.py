@@ -160,7 +160,8 @@ with st.container(border=True):
                                     label_visibility="collapsed")
     with help_col:
         st.caption("Needs a `transcript` column with one line per turn: `assistant:` (the agent) and "
-                   "`user:` (the customer). Add one `expected::<Disposition name>` column per "
+                   "`user:` (the customer). Add a `call_date` column (when the call happened) so "
+                   "relative dates like \"tomorrow\" resolve correctly. Add one `expected::<Disposition name>` column per "
                    "disposition. The name must match the extraction name in Bolna exactly.")
         with open(os.path.join(HERE, "sample_test_cases.csv"), "rb") as f:
             st.download_button("⬇️ Sample CSV", f.read(), "sample_test_cases.csv")
