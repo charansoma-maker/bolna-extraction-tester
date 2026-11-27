@@ -85,7 +85,7 @@ def chat_html(transcript):
             continue
         who, _, text = line.partition(":")
         if _ and who.strip().lower() in ("agent", "assistant", "bot"):
-            out.append(f'<div class="msg agent"><b>Agent</b>{esc(text.strip())}</div>')
+            out.append(f'<div class="msg agent"><b>Assistant</b>{esc(text.strip())}</div>')
         elif _ and who.strip().lower() in ("user", "customer", "caller", "human"):
             out.append(f'<div class="msg user"><b>User</b>{esc(text.strip())}</div>')
         else:
@@ -132,7 +132,8 @@ with st.container(border=True):
         uploaded = st.file_uploader("CSV, Excel, JSON or JSONL", type=["csv", "xlsx", "json", "jsonl"],
                                     label_visibility="collapsed")
     with help_col:
-        st.caption("Needs a `transcript` column, plus one `expected::<Disposition name>` column per "
+        st.caption("Needs a `transcript` column with one line per turn: `assistant:` (the agent) and "
+                   "`user:` (the customer). Add one `expected::<Disposition name>` column per "
                    "disposition. The name must match the extraction name in Bolna exactly.")
         with open(os.path.join(HERE, "sample_test_cases.csv"), "rb") as f:
             st.download_button("⬇️ Sample CSV", f.read(), "sample_test_cases.csv")

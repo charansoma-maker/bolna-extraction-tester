@@ -12,8 +12,11 @@ Bulk-tests a Bolna agent's extractions (dispositions) against transcripts with g
 ## Input format
 ```
 test_id,transcript,call_date,expected::Call Outcome,expected::Customer Email
-tc_001,"Agent: ... Customer: ...",,follow_up,ravi@example.com
+tc_001,"assistant: Hi, how can I help?
+user: I'd like a callback. My email is ravi@example.com",,follow_up,ravi@example.com
 ```
+- **Transcript format:** one line per turn, `assistant:` for the agent and `user:` for the customer
+  (the format Bolna's extraction prompts expect). Don't use `Agent:` / `Customer:`.
 - `transcript` required (max 50,000 chars). `test_id`, `call_date` optional.
 - `expected::<name>` must match the Bolna extraction name exactly. Blank = not scored.
 - JSON/JSONL may instead use `"expected": {"Call Outcome": "follow_up"}`.

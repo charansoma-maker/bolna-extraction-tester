@@ -1,4 +1,11 @@
 test_id,transcript,call_date,expected::Agent Handover Needed,expected::Customer Email,expected::Call Outcome
-tc_001,"Agent: Hi, how can I help? Customer: Can I talk to a real person please? My email is ravi@example.com",2026-11-20T10:00:00Z,Yes,ravi@example.com,follow_up
-tc_002,"Agent: Hello! Customer: I'm interested in the enterprise plan, let's book a demo tomorrow.",,No,,interested
-tc_003,"Agent: Hi there. Customer: Not interested, please don't call again.",,No,,not_interested
+tc_001,"assistant: Hi, how can I help you today?
+user: Can I talk to a real person please?
+assistant: Sure, I can arrange that. Can I have your email for the follow-up?
+user: Yes, it's ravi@example.com",2026-11-20T10:00:00Z,Yes,ravi@example.com,follow_up
+tc_002,"assistant: Hello! Thanks for calling. How can I help?
+user: I'm interested in the enterprise plan, let's book a demo tomorrow.
+assistant: Great, I'll set up the demo for tomorrow.",,No,,interested
+tc_003,"assistant: Hi there, am I speaking with Priya?
+user: Yes, but I'm not interested, please don't call again.
+assistant: Understood, I'll make a note. Have a good day.",,No,,not_interested
