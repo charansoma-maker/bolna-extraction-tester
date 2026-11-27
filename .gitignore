@@ -18,3 +18,4 @@ bolna_extraction_tester.zip
 # run data dropped into the project folder
 *.jsonl
 *.xlsx
+*.html

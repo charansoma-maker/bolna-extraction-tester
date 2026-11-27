@@ -5,22 +5,108 @@ import html
 import io
 import json
 import os
+import threading
 import time
 import zipfile
-from collections import deque
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from bolna_tester import (TYPE_LABELS, bolna_output, bolna_output_wide, build_report, expected_columns, expected_names,
-                          extraction_catalog, load_cases, load_raw, run_requests, save_report)
+from bolna_tester import (TYPE_LABELS, bolna_output_wide, build_report, call_test_endpoint, expected_names,
+                          extraction_catalog, html_report, load_cases, load_raw, mock_call, run_requests,
+                          save_report, validate_cases)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(HERE, "results")
 PAGE_SIZE = 25
+IST = ZoneInfo("Asia/Kolkata")  # the server runs on UTC; show everything in Indian time
+
+
+def now_ist():
+    return datetime.now(IST)
+
+
+# ------------------------------------------------------- background runs ---
+# Runs execute in a server-side thread, independent of the browser tab, so a closed tab or a
+# sleeping laptop doesn't stop them. Responses are appended to raw_responses.jsonl as they arrive.
+@st.cache_resource
+def _run_registry():
+    return {}
+
+
+def _status_path(rd):
+    return os.path.join(rd, "status.json")
+
+
+def read_status(rd):
+    try:
+        stt = json.load(open(_status_path(rd)))
+    except (OSError, ValueError):
+        stt = {}
+    if stt.get("state") == "running":
+        t = _run_registry().get(rd)
+        if not (t and t.is_alive()):
+            stt["state"] = "interrupted"  # server restarted mid-run
+    return stt
+
+
+def _write_status(rd, **kw):
+    stt = {}
+    try:
+        stt = json.load(open(_status_path(rd)))
+    except (OSError, ValueError):
+        pass
+    stt.update(kw)
+    json.dump(stt, open(_status_path(rd), "w"))
+
+
+def start_run(rd, run_df, agent, key, n_workers, is_mock, resume=False):
+    _write_status(rd, state="running", total=len(run_df), started=now_ist().isoformat(), error=None)
+
+    def target():
+        try:
+            run_requests(run_df, agent, key, n_workers, raw_path=os.path.join(rd, "raw_responses.jsonl"),
+                         resume=resume, mock=is_mock)
+            _write_status(rd, state="done", finished=now_ist().isoformat())
+        except Exception as e:  # keep whatever was saved; report the error
+            _write_status(rd, state="error", error=str(e)[:500], finished=now_ist().isoformat())
+
+    t = threading.Thread(target=target, daemon=True, name=f"run-{os.path.basename(rd)}")
+    _run_registry()[rd] = t
+    t.start()
+
+
+def run_progress(rd):
+    """(done, ok, failed, last results) from what's been saved so far."""
+    res = load_raw(os.path.join(rd, "raw_responses.jsonl"))
+    ok = sum(1 for r in res.values() if r.get("ok"))
+    return len(res), ok, len(res) - ok, res
+
+
+def run_when(d):
+    """Folder names are server time. New runs (IST) store `started`; older ones were UTC on the cloud."""
+    stt = read_status(os.path.join(RESULTS_DIR, d))
+    if stt.get("started"):
+        return datetime.fromisoformat(stt["started"]).astimezone(IST)
+    try:  # older runs: folder name is the server's local time (UTC on Streamlit Cloud)
+        return datetime.strptime(d, "%Y%m%d_%H%M%S").astimezone().astimezone(IST)
+    except ValueError:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def _counts(path, mtime):
+    res = load_raw(path)
+    return len(res), sum(1 for r in res.values() if r.get("ok"))
+
+
+def response_counts(rd):
+    p = os.path.join(rd, "raw_responses.jsonl")
+    return _counts(p, os.path.getmtime(p)) if os.path.exists(p) else (0, 0)
 
 st.set_page_config(page_title="Bolna Extraction Tester", page_icon="🧪", layout="wide")
 
@@ -112,19 +198,20 @@ with st.sidebar:
 
     def run_label(d):
         rd = os.path.join(RESULTS_DIR, d)
-        try:
-            when = datetime.strptime(d, "%Y%m%d_%H%M%S").strftime("%d %b %Y, %H:%M")
-        except ValueError:
-            when = d
-        try:
-            n = sum(1 for _ in open(os.path.join(rd, "raw_responses.jsonl")))
-        except OSError:
-            n = 0
+        w = run_when(d)
+        when = w.strftime("%d %b %Y, %I:%M %p IST") if w else d
+        n = response_counts(rd)[0]
+        stt = read_status(rd)
+        badge = {"running": " · ⏳ running", "interrupted": " · ⚠️ interrupted", "error": " · ⚠️ error"}.get(
+            stt.get("state"), "")
+        if stt.get("total") and n < stt["total"] and not badge:
+            badge = " · incomplete"
         try:
             agent = json.load(open(os.path.join(rd, "meta.json"))).get("agent_id") or "demo"
         except (OSError, ValueError):
             agent = "?"
-        return f"{when} · {n} responses · agent {agent[:8]}"
+        tot = f"/{stt['total']}" if stt.get("total") else ""
+        return f"{when} · {n}{tot} responses · agent {agent[:8]}{badge}"
 
     if runs:
         pick = st.selectbox("Open a saved run", runs, index=None, placeholder="Choose a run…",
@@ -140,9 +227,29 @@ with st.sidebar:
         has_input = bool(pick) and os.path.exists(os.path.join(RESULTS_DIR, pick, "input.csv"))
         if st.button("Open run", disabled=not has_input, width="stretch"):
             rd = os.path.join(RESULTS_DIR, pick)
+            running = read_status(rd).get("state") == "running"
             st.session_state.update(df=load_cases(os.path.join(rd, "input.csv")),
-                                    results=load_raw(os.path.join(rd, "raw_responses.jsonl")),
-                                    run_dir=rd, file_key=f"run:{pick}", scroll=True)
+                                    results=None if running else load_raw(os.path.join(rd, "raw_responses.jsonl")),
+                                    run_dir=rd, file_key=f"run:{pick}", scroll=not running,
+                                    active_run=rd if running else None)
+        if has_input:
+            rd = os.path.join(RESULTS_DIR, pick)
+            stt = read_status(rd)
+            n_in = len(pd.read_csv(os.path.join(rd, "input.csv"), usecols=[0]))
+            done_ok = response_counts(rd)[1]
+            if stt.get("state") != "running" and done_ok < n_in:
+                try:
+                    meta = json.load(open(os.path.join(rd, "meta.json")))
+                except (OSError, ValueError):
+                    meta = {}
+                can = meta.get("mock") or bool(api_key)
+                if st.button(f"▶ Resume: {n_in - done_ok} call(s) left", width="stretch", disabled=not can,
+                             help="Calls only the transcripts that haven't succeeded yet. Needs your API key above."):
+                    start_run(rd, load_cases(os.path.join(rd, "input.csv")), meta.get("agent_id") or agent_id,
+                              api_key, workers, bool(meta.get("mock")), resume=True)
+                    st.session_state.update(df=load_cases(os.path.join(rd, "input.csv")), results=None, run_dir=rd,
+                                            active_run=rd, file_key=f"run:{pick}")
+                    st.rerun()
     else:
         st.caption("Runs you finish will show up here.")
 
@@ -190,6 +297,10 @@ with st.container(border=True):
                 ("".join(f'<span class="pill">{esc(n)}</span>' for n in names) or
                  "<i>None. Results will show what Bolna extracted, without scoring.</i>"),
                 unsafe_allow_html=True)
+    checks = validate_cases(df)
+    for lvl, msg in checks:
+        {"error": st.error, "warn": st.warning, "info": st.info}[lvl](msg, icon={"error": "⛔", "warn": "⚠️", "info": "ℹ️"}[lvl])
+    blocked = any(l == "error" for l, _ in checks)
     with st.expander("Preview file"):
         st.dataframe(df.head(50), width="stretch", hide_index=True)
 
@@ -199,47 +310,90 @@ with st.container(border=True):
     ready = mock or (api_key and agent_id)
     if not ready:
         st.info("Enter your Bolna API key and Agent ID in the sidebar (or turn on Demo mode).", icon="🔑")
-    if st.button(f"▶  Run {len(df):,} transcripts", type="primary", disabled=not ready,
+    # --- check names with one call before spending a long run
+    qc1, qc2 = st.columns([1, 2])
+    if qc1.button("🔎 Test 1 call first", disabled=not ready or blocked, width="stretch",
+                  help="Sends the first transcript and checks that your column names match the agent's extractions."):
+        with st.spinner("Calling Bolna with the first transcript…"):
+            row = df.iloc[0]
+            if mock:
+                r1 = mock_call(str(row["transcript"]))
+            else:
+                import requests as _rq
+                r1 = call_test_endpoint(_rq.Session(), agent_id.strip(), api_key.strip(), str(row["transcript"]),
+                                        str(row.get("call_date", "")) or None, max_retries=2)
+        st.session_state["quick"] = r1
+    q = st.session_state.get("quick")
+    if q:
+        if not q.get("ok"):
+            qc2.error(f"The test call failed: HTTP {q.get('status')} {str(q.get('error', ''))[:200]}")
+        else:
+            got = set(extraction_catalog({"x": q})["extraction"])
+            miss = [n for n in expected_names(df) if n not in got]
+            if miss:
+                qc2.error("These columns don't match any extraction on the agent, so they won't be scored: "
+                          + ", ".join(f"**{m}**" for m in miss) + f".  \nThe agent returns: {', '.join(sorted(got))}")
+            else:
+                qc2.success(f"All {len(expected_names(df))} columns match the agent's extractions "
+                            f"({q.get('latency_s')}s for one call).")
+
+    active = st.session_state.get("active_run")
+    if not active:  # reattach to a run started from another tab / before the laptop slept
+        for d in (sorted(os.listdir(RESULTS_DIR), reverse=True) if os.path.isdir(RESULTS_DIR) else []):
+            if read_status(os.path.join(RESULTS_DIR, d)).get("state") == "running":
+                st.info(f"A run is in progress (started {run_when(d).strftime('%I:%M %p IST')}).", icon="⏳")
+                if st.button("Watch it", key=f"watch_{d}"):
+                    rd = os.path.join(RESULTS_DIR, d)
+                    st.session_state.update(active_run=rd, run_dir=rd, results=None,
+                                            df=load_cases(os.path.join(rd, "input.csv")), file_key=f"run:{d}")
+                    st.rerun()
+                break
+
+    if st.button(f"▶  Run {len(df):,} transcripts", type="primary", disabled=not ready or blocked or bool(active),
                  width="stretch"):
-        run_dir = os.path.join(RESULTS_DIR, datetime.now().strftime("%Y%m%d_%H%M%S"))
-        os.makedirs(run_dir, exist_ok=True)
-        df.to_csv(os.path.join(run_dir, "input.csv"), index=False)
-        json.dump({"agent_id": agent_id, "mock": mock}, open(os.path.join(run_dir, "meta.json"), "w"))
+        rd = os.path.join(RESULTS_DIR, now_ist().strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(rd, exist_ok=True)
+        df.to_csv(os.path.join(rd, "input.csv"), index=False)
+        json.dump({"agent_id": agent_id.strip(), "mock": mock, "started": now_ist().isoformat()},
+                  open(os.path.join(rd, "meta.json"), "w"))
+        start_run(rd, df, agent_id.strip(), api_key.strip(), workers, mock)
+        st.session_state.update(active_run=rd, run_dir=rd, results=None)
+        st.rerun()
 
-        with st.status(f"Running {len(df):,} transcripts through Bolna…", expanded=True) as status:
-            bar = st.progress(0.0, text="Starting…")
-            m1, m2, m3, m4 = st.columns(4)
-            ph = [m.empty() for m in (m1, m2, m3, m4)]
-            log_ph = st.empty()
-            log, stats, t0 = deque(maxlen=12), {"ok": 0, "fail": 0, "lat": []}, time.time()
+    if active:
+        @st.fragment(run_every=2)
+        def live(rd):
+            stt = read_status(rd)
+            total = stt.get("total") or 1
+            done, ok, bad, res = run_progress(rd)
+            started = datetime.fromisoformat(stt["started"]) if stt.get("started") else now_ist()
+            elapsed = (now_ist() - started).total_seconds()
+            rate = done / elapsed if elapsed > 0 and done else 0
+            eta = (total - done) / rate if rate else 0
+            st.markdown(f"**⏳ Running {total:,} transcripts through Bolna.** It runs on the server, so you can "
+                        "close this tab or let your laptop sleep and come back. Progress is saved as it goes.")
+            st.progress(min(done / total, 1.0), text=f"{done:,} of {total:,} calls done")
+            m = st.columns(4)
+            m[0].metric("Done", f"{done:,}/{total:,}")
+            m[1].metric("Succeeded", f"{ok:,}")
+            m[2].metric("Failed", f"{bad:,}")
+            m[3].metric("Time left", f"~{eta/60:.1f} min" if done else "…")
+            last = list(res.values())[-12:][::-1]
+            if last:
+                st.dataframe(pd.DataFrame([{"": "✅" if r.get("ok") else "❌", "test_id": r["test_id"],
+                                            "latency (s)": r.get("latency_s"),
+                                            "detail": "" if r.get("ok") else str(r.get("error", ""))[:120]}
+                                           for r in last]), width="stretch", hide_index=True)
+            if stt.get("state") != "running":
+                if stt.get("state") in ("error", "interrupted"):
+                    st.session_state["run_note"] = (f"The run stopped early ({stt.get('error') or 'server restarted'}). "
+                                                    "Everything received so far is shown; use Resume in the sidebar "
+                                                    "to finish the rest.")
+                st.session_state.update(results=res, active_run=None, scroll=True)
+                st.rerun(scope="app")
 
-            def progress(done, total, res):
-                if res is not None:
-                    if res.get("ok"):
-                        stats["ok"] += 1
-                        stats["lat"].append(res.get("latency_s") or 0)
-                    else:
-                        stats["fail"] += 1
-                    log.appendleft({"": "✅" if res.get("ok") else "❌", "test_id": res["test_id"],
-                                    "latency (s)": res.get("latency_s"),
-                                    "detail": "" if res.get("ok") else str(res.get("error", ""))[:120]})
-                elapsed = time.time() - t0
-                rate = done / elapsed if elapsed > 0 and done else 0
-                eta = (total - done) / rate if rate else 0
-                bar.progress(done / max(total, 1), text=f"{done:,} of {total:,} calls done")
-                ph[0].metric("Done", f"{done:,}/{total:,}")
-                ph[1].metric("Succeeded", f"{stats['ok']:,}")
-                ph[2].metric("Failed", f"{stats['fail']:,}")
-                ph[3].metric("Time left", f"~{eta/60:.1f} min" if done else "…")
-                if log:
-                    log_ph.dataframe(pd.DataFrame(log), width="stretch", hide_index=True)
-
-            results = run_requests(df, agent_id.strip(), api_key.strip(), workers,
-                                   raw_path=os.path.join(run_dir, "raw_responses.jsonl"),
-                                   progress_cb=progress, mock=mock)
-            status.update(label=f"Done: {stats['ok']:,} succeeded, {stats['fail']:,} failed, "
-                                f"in {(time.time()-t0)/60:.1f} min", state="complete", expanded=False)
-        st.session_state.update(results=results, run_dir=run_dir, scroll=True)
+        live(active)
+        st.stop()
 
 results = st.session_state.get("results")
 if not results:
@@ -254,6 +408,8 @@ captured_rows = detail[detail["captured"]] if not detail.empty else detail
 returned = set(extraction_catalog(results)["extraction"])
 
 st.header("Results", anchor="results")
+if st.session_state.get("run_note"):
+    st.warning(st.session_state.pop("run_note"), icon="⚠️")
 if st.session_state.pop("scroll", False):
     components.html("<script>setTimeout(()=>{const e=window.parent.document.getElementById('results');"
                     "if(e)e.scrollIntoView({behavior:'smooth',block:'start'});},300);</script>", height=0)
@@ -286,8 +442,24 @@ xlsx_bytes = st.session_state.get("xlsx_bytes")
 if st.session_state.get("xlsx_err"):
     st.warning(f"Couldn't build the Excel report ({st.session_state['xlsx_err']}). "
                "The CSV and raw downloads below still have all the data.", icon="⚠️")
+try:
+    _meta = json.load(open(os.path.join(run_dir, "meta.json")))
+except (OSError, ValueError):
+    _meta = {}
+_rn = os.path.basename(run_dir.rstrip("/"))
+_w = run_when(_rn) if os.path.isdir(os.path.join(RESULTS_DIR, _rn)) else None
+html_key = (xlsx_key, "html")
+if st.session_state.get("html_key") != html_key:
+    st.session_state.update(html_key=html_key, html_bytes=html_report(
+        report, df, results, "Bolna extraction report",
+        {"agent_id": _meta.get("agent_id"), "when": _w.strftime("%d %b %Y, %I:%M %p IST") if _w else None}
+    ).encode("utf-8"))
+st.download_button("⬇️ Dashboard report (HTML, shareable)", st.session_state["html_bytes"],
+                   f"extraction_report_{_rn}.html", "text/html", type="primary", width="stretch",
+                   help="One file that opens in any browser: summary, accuracy by disposition, confusion grid, "
+                        "and every wrong/missed case with its transcript.")
 d1, d2, d3 = st.columns(3)
-d1.download_button("⬇️ Full report (Excel)", xlsx_bytes or b"", "extraction_report.xlsx", type="primary",
+d1.download_button("⬇️ Full report (Excel)", xlsx_bytes or b"", "extraction_report.xlsx",
                    width="stretch", disabled=not xlsx_bytes,
                    help="Summary, wrong, missed, all comparisons, and everything Bolna extracted.")
 d2.download_button("⬇️ Bolna output (CSV)", bolna_output_wide(df, results).to_csv(index=False).encode("utf-8-sig"),
@@ -452,3 +624,11 @@ failed = cases[~cases["ok"]]
 if len(failed):
     with st.expander(f"⚠️ Failed requests ({len(failed)})", expanded=True):
         st.dataframe(failed[["test_id", "http_status", "error"]], width="stretch", hide_index=True)
+        rd = st.session_state.get("run_dir")
+        can_retry = rd and os.path.exists(os.path.join(rd, "input.csv")) and (mock or (api_key and agent_id))
+        if st.button(f"🔁 Retry {len(failed)} failed call(s)", disabled=not can_retry,
+                     help="Calls only the failed transcripts again and adds them to this run."):
+            start_run(rd, df, (agent_id or _meta.get("agent_id") or "").strip(), api_key.strip(), workers,
+                      mock, resume=True)
+            st.session_state.update(active_run=rd, results=None)
+            st.rerun()

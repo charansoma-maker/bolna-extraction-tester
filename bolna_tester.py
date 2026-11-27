@@ -67,8 +67,11 @@ def load_cases(src, filename=None) -> pd.DataFrame:
     # No `expected::` columns at all? Treat every other column as an expected value
     # (so a file whose columns are just the extraction names still gets scored).
     reserved = {"test_id", "transcript", "call_date", "expected"}
+    auto = False
     if not any(str(c).startswith(EXPECTED_PREFIX) for c in df.columns):
-        df = df.rename(columns={c: EXPECTED_PREFIX + str(c) for c in df.columns if c not in reserved})
+        extra = [c for c in df.columns if c not in reserved]
+        df = df.rename(columns={c: EXPECTED_PREFIX + str(c) for c in extra})
+        auto = bool(extra)
     if "test_id" not in df.columns:
         df.insert(0, "test_id", [f"case_{i+1:05d}" for i in range(len(df))])
     df["test_id"] = df["test_id"].astype(str)
@@ -77,6 +80,7 @@ def load_cases(src, filename=None) -> pd.DataFrame:
     df = df.fillna("")
     for c in expected_columns(df):
         df[c] = df[c].astype(str).map(lambda v: "" if is_blank(v) else v)
+    df.attrs["auto_prefixed"] = auto
     return df
 
 
@@ -649,6 +653,261 @@ def save_report(report, out_dir, config=None, df=None, results=None):
     for k in ("summary", "detail", "cases"):
         report[k].to_csv(os.path.join(out_dir, f"{k}.csv"), index=False)
     return xlsx
+
+
+# ------------------------------------------------------------- checks ----
+def validate_cases(df):
+    """Problems in a test file that would make results misleading. Returns [(level, message)]."""
+    out = []
+    if df.attrs.get("auto_prefixed"):
+        out.append(("info", "No `expected::` prefix found, so every column other than test_id / transcript / "
+                            "call_date is treated as an expected value."))
+    if not expected_columns(df):
+        out.append(("warn", "No expected-value columns, so nothing will be scored (you'll still see Bolna's output)."))
+    if "call_date" not in df.columns:
+        out.append(("warn", "No `call_date` column. Relative dates like \"tomorrow\", \"today 6 pm\" or \"4 days ago\" "
+                            "will be resolved from the day you run the test, so date/time extractions will look "
+                            "wrong. Add each call's original date, e.g. 2026-11-27T10:00:00+05:30."))
+    else:
+        cd = df["call_date"].astype(str).str.strip()
+        blank = int((cd == "").sum())
+        bad = int(sum(1 for v in cd if v and _parse_dt(v) is None))
+        if blank:
+            out.append(("warn", f"{blank} row(s) have an empty `call_date`; their relative dates will resolve from today."))
+        if bad:
+            out.append(("warn", f"{bad} row(s) have a `call_date` that isn't a valid date/time."))
+    t = df["transcript"].astype(str)
+    empty = int((t.str.strip() == "").sum())
+    if empty:
+        out.append(("error" if empty == len(df) else "warn", f"{empty} transcript(s) are empty."))
+    long_ = int((t.str.len() > MAX_TRANSCRIPT_CHARS).sum())
+    if long_:
+        out.append(("warn", f"{long_} transcript(s) are over {MAX_TRANSCRIPT_CHARS:,} characters and will be cut off."))
+    old = int(t.str.contains(r"(?im)^\s*(agent|customer)\s*:").sum())
+    if old:
+        out.append(("warn", f"{old} transcript(s) use `Agent:` / `Customer:`. Use `assistant:` (agent) and "
+                            "`user:` (customer), the format Bolna's extraction prompts expect."))
+    nofmt = int((~t.str.contains(r"(?im)^\s*(assistant|user|agent|customer)\s*:") & (t.str.strip() != "")).sum())
+    if nofmt:
+        out.append(("warn", f"{nofmt} transcript(s) have no `assistant:` / `user:` lines."))
+    return out
+
+
+# ------------------------------------------------------------- html report -
+_REPORT_CSS = """
+:root{--bg:#f7f7f8;--card:#fff;--fg:#1f2328;--mute:#6b7280;--line:#e5e7eb;--ok:#16a34a;--okbg:#dcfce7;
+--bad:#dc2626;--badbg:#fee2e2;--mid:#d97706;--midbg:#fef3c7;--acc:#2563eb;--accbg:#dbeafe}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--fg:#e6e6e6;--mute:#9aa0a6;--line:#2a2f37;
+--okbg:#12301d;--badbg:#3a1616;--midbg:#3a2a10;--accbg:#13233f}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans Devanagari",sans-serif}
+.wrap{max-width:1200px;margin:0 auto;padding:24px 16px 64px}h1{margin:0 0 4px;font-size:26px}
+h2{margin:32px 0 12px;font-size:19px}.mute{color:var(--mute)}.grid{display:grid;gap:12px}
+.kpis{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}.card{background:var(--card);border:1px solid var(--line);
+border-radius:12px;padding:14px 16px}.lbl{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute)}
+.val{font-size:28px;font-weight:700}.ok{color:var(--ok)}.bad{color:var(--bad)}.mid{color:var(--mid)}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-size:12px;color:var(--mute);font-weight:600;background:var(--bg)}td.n{text-align:right;font-variant-numeric:tabular-nums}
+.bar{height:10px;border-radius:6px;background:var(--line);overflow:hidden;display:flex;min-width:120px}
+.bar i{display:block;height:100%}.cat td{background:var(--bg);font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--line)}
+.p-ok{background:var(--okbg);color:var(--ok);border-color:transparent}.p-bad{background:var(--badbg);color:var(--bad);border-color:transparent}
+.p-mid{background:var(--midbg);color:var(--mid);border-color:transparent}
+details.disp{background:var(--card);border:1px solid var(--line);border-radius:12px;margin:8px 0}
+details.disp>summary{cursor:pointer;padding:12px 16px;font-weight:600;list-style:none}
+details.disp>summary::-webkit-details-marker{display:none}details.disp[open]>summary{border-bottom:1px solid var(--line)}
+.inner{padding:12px 16px}.case{border:1px solid var(--line);border-left:5px solid var(--bad);border-radius:10px;padding:10px 12px;margin:8px 0}
+.case.missed{border-left-color:var(--mid)}.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:8px 0}
+.box{background:var(--bg);border-radius:8px;padding:6px 10px}.box b{display:block;font-size:11px;color:var(--mute);
+text-transform:uppercase;letter-spacing:.05em;font-weight:600}.why{font-size:13px;color:var(--mute)}
+.chat{max-height:340px;overflow:auto;margin-top:6px}.msg{padding:6px 10px;border-radius:9px;margin:4px 0;max-width:85%}
+.msg.a{background:var(--accbg)}.msg.u{background:var(--bg);margin-left:auto}.msg em{display:block;font-style:normal;
+font-size:10px;text-transform:uppercase;color:var(--mute)}.cm td,.cm th{text-align:center;padding:5px 6px;font-size:12px}
+.cm th.r{text-align:right}.notes li{margin:4px 0}.scroll{overflow-x:auto}
+@media (max-width:700px){.row2{grid-template-columns:1fr}}
+"""
+
+
+def _e(v):
+    import html as _html
+    return _html.escape("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v))
+
+
+def _chat(transcript):
+    out = []
+    for line in str(transcript).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        who, sep, text = line.partition(":")
+        w = who.strip().lower()
+        if sep and w in ("assistant", "agent"):
+            out.append(f'<div class="msg a"><em>Assistant</em>{_e(text.strip())}</div>')
+        elif sep and w in ("user", "customer"):
+            out.append(f'<div class="msg u"><em>User</em>{_e(text.strip())}</div>')
+        else:
+            out.append(f'<div class="msg">{_e(line)}</div>')
+    return '<div class="chat">' + "".join(out) + "</div>"
+
+
+def disposition_stats(detail, names):
+    rows = []
+    for name in names:
+        dd = detail[detail["extraction"] == name] if not detail.empty else detail
+        if dd.empty:
+            continue
+        cap, cor = int(dd["captured"].sum()), int(dd["correct"].sum())
+        cat = dd["category"].replace("", pd.NA).dropna()
+        typ = dd["answer_type"].replace("", pd.NA).dropna()
+        rows.append({"category": cat.mode().iloc[0] if len(cat) else "Uncategorised", "disposition": name,
+                     "type": typ.mode().iloc[0] if len(typ) else "", "captured": cap, "correct": cor,
+                     "wrong": cap - cor, "missed": int((dd["scored"] & ~dd["captured"]).sum()),
+                     "accuracy": round(100 * cor / cap, 1) if cap else None})
+    return pd.DataFrame(rows)
+
+
+def html_report(report, df, results, title="Bolna extraction report", meta=None, max_cases=300):
+    """A self-contained, shareable HTML version of the dashboard."""
+    meta = meta or {}
+    detail, cases = report["detail"], report["cases"]
+    names = expected_names(df)
+    returned = set(extraction_catalog(results)["extraction"])
+    missing = [n for n in names if n not in returned]
+    skipped_text = report.get("text_skipped", [])
+    stats = disposition_stats(detail, [n for n in names if n not in missing and n not in skipped_text])
+    cap = int(detail["captured"].sum()) if not detail.empty else 0
+    cor = int(detail["correct"].sum()) if not detail.empty else 0
+    acc = 100 * cor / cap if cap else None
+    n_ok = int(cases["ok"].sum()) if len(cases) else 0
+    failed = cases[~cases["ok"]] if len(cases) else cases
+    tone = lambda a: "" if a is None else ("ok" if a >= 90 else "mid" if a >= 70 else "bad")
+
+    h = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' "
+         f"content='width=device-width,initial-scale=1'><title>{_e(title)}</title><style>{_REPORT_CSS}</style>"
+         f"</head><body><div class='wrap'><h1>{_e(title)}</h1><div class='mute'>"
+         + " · ".join(_e(x) for x in [meta.get("agent_id") and f"Agent {meta['agent_id']}", meta.get("when"),
+                                       f"{len(df):,} transcripts"] if x)
+         + "</div>"]
+
+    # KPIs
+    k = [("Overall accuracy", f"{acc:.1f}%" if acc is not None else "–", f"{cor:,} correct of {cap:,} captured", tone(acc)),
+         ("Transcripts processed", f"{n_ok:,}", f"of {len(cases):,}", ""),
+         ("Failed requests", f"{len(failed):,}", "", "bad" if len(failed) else "ok"),
+         ("Dispositions scored", f"{len(stats)}", f"{len(returned)} returned by the agent", ""),
+         ("Missed values", f"{int(stats['missed'].sum()) if len(stats) else 0:,}", "expected, Bolna returned nothing", "")]
+    h.append("<div class='grid kpis' style='margin-top:18px'>" + "".join(
+        f"<div class='card'><div class='lbl'>{a}</div><div class='val {c}'>{b}</div><div class='mute'>{d}</div></div>"
+        for a, b, d, c in k) + "</div>")
+
+    # notes
+    notes = []
+    if missing:
+        notes.append("Bolna never returned these columns, so they weren't scored (check the name matches the "
+                     "extraction exactly): " + ", ".join(f"<b>{_e(m)}</b>" for m in missing))
+    if skipped_text:
+        notes.append("Not scored because Bolna answers them as plain text: " + ", ".join(_e(m) for m in skipped_text))
+    for lvl, msg in validate_cases(df):
+        notes.append(_e(msg))
+    if notes:
+        h.append("<h2>Notes</h2><div class='card'><ul class='notes'>" + "".join(f"<li>{n}</li>" for n in notes) + "</ul></div>")
+
+    h.append("<h2>How to read this</h2><div class='card mute'><b>Accuracy = Correct ÷ Captured.</b> Captured = calls "
+             "where Bolna returned a value. Wrong = captured but different from expected (including a value where "
+             "none was expected). Missed = a value was expected but Bolna returned nothing, often because the "
+             "parent disposition was different so the follow-up was skipped (<i>parent_mismatch</i>). Missed is "
+             "not part of accuracy. Comparison follows Bolna's answer type: objective = exact, timestamp = same "
+             "date (and time if given), numeric = same number.</div>")
+
+    # table
+    if len(stats):
+        h.append("<h2>Accuracy by disposition</h2><div class='scroll'><table><tr><th>Disposition</th><th>Type</th>"
+                 "<th class='n'>Captured</th><th class='n'>✅ Correct</th><th class='n'>❌ Wrong</th>"
+                 "<th class='n'>⚪ Missed</th><th class='n'>Accuracy</th><th>Correct vs wrong</th></tr>")
+        for catn, g in stats.groupby("category", sort=True):
+            h.append(f"<tr class='cat'><td colspan='8'>{_e(catn)}</td></tr>")
+            for _, s in g.sort_values("accuracy", na_position="last").iterrows():
+                a = s["accuracy"]
+                tot = max(s["captured"], 1)
+                h.append(f"<tr><td><a href='#d-{_e(s['disposition'])}'>{_e(s['disposition'])}</a></td>"
+                         f"<td><span class='pill'>{_e(s['type'])}</span></td><td class='n'>{s['captured']:,}</td>"
+                         f"<td class='n'>{s['correct']:,}</td><td class='n'>{s['wrong']:,}</td>"
+                         f"<td class='n'>{s['missed']:,}</td><td class='n {tone(a)}'><b>"
+                         f"{'–' if a is None or pd.isna(a) else f'{a:.1f}%'}</b></td><td><div class='bar'>"
+                         f"<i style='width:{100*s['correct']/tot:.1f}%;background:var(--ok)'></i>"
+                         f"<i style='width:{100*s['wrong']/tot:.1f}%;background:var(--bad)'></i></div></td></tr>")
+        h.append("</table></div>")
+
+    # confusion matrices for objective extractions
+    obj = stats[stats["type"] == "Objective"]["disposition"].tolist() if len(stats) else []
+    for name in obj:
+        dd = detail[(detail["extraction"] == name) & detail["scored"]]
+        if dd.empty:
+            continue
+        cm = pd.crosstab(dd["expected"].astype(str), dd["predicted"].astype(str).replace("", "(nothing)"))
+        if cm.shape[0] > 40 or cm.shape[1] > 40:
+            continue
+        mx = cm.values.max() or 1
+        h.append(f"<h2>{_e(name)}: expected vs what Bolna said</h2><div class='mute' style='margin-bottom:8px'>"
+                 "Rows = expected, columns = Bolna. Green diagonal = correct; red = confusions.</div>"
+                 "<div class='scroll'><table class='cm'><tr><th class='r'>expected ↓ / Bolna →</th>"
+                 + "".join(f"<th>{_e(c)}</th>" for c in cm.columns) + "<th>total</th></tr>")
+        for r in cm.index:
+            cells = []
+            for c in cm.columns:
+                v = int(cm.loc[r, c])
+                if not v:
+                    cells.append("<td class='mute'>·</td>")
+                    continue
+                alpha = 0.15 + 0.6 * v / mx
+                col = "22,163,74" if normalize(r) == normalize(c) else "220,38,38"
+                cells.append(f"<td style='background:rgba({col},{alpha:.2f})'><b>{v}</b></td>")
+            h.append(f"<tr><th class='r'>{_e(r)}</th>{''.join(cells)}<td class='mute'>{int(cm.loc[r].sum())}</td></tr>")
+        h.append("</table></div>")
+
+    # drill-down
+    if len(stats):
+        h.append("<h2>Drill down</h2><div class='mute'>Each disposition lists its wrong and missed cases, with Bolna's "
+                 "reasoning and the transcript.</div>")
+        for catn, g in stats.groupby("category", sort=True):
+            h.append(f"<h3 class='mute' style='text-transform:uppercase;font-size:12px;letter-spacing:.06em;"
+                     f"margin:18px 0 4px'>{_e(catn)}</h3>")
+            for _, s in g.sort_values("accuracy", na_position="last").iterrows():
+                name, a = s["disposition"], s["accuracy"]
+                icon = "⚪" if a is None or pd.isna(a) else "🟢" if a >= 90 else "🟡" if a >= 70 else "🔴"
+                dd = detail[detail["extraction"] == name]
+                wrong = dd[dd["captured"] & ~dd["correct"]]
+                missed_ = dd[dd["scored"] & ~dd["captured"]]
+                h.append(f"<details class='disp' id='d-{_e(name)}'><summary>{icon} {_e(name)} "
+                         f"<span class='pill'>{_e(s['type'])}</span> <span class='mute'>— {s['correct']:,}/"
+                         f"{s['captured']:,} correct ({'–' if a is None or pd.isna(a) else f'{a:.0f}%'})"
+                         f"{f' · ❌ {len(wrong)} wrong' if len(wrong) else ''}"
+                         f"{f' · ⚪ {len(missed_)} missed' if len(missed_) else ''}</span></summary><div class='inner'>")
+                if wrong.empty and missed_.empty:
+                    h.append("<div class='mute'>Everything captured was correct and nothing was missed.</div>")
+                for label, rows, cls in (("Wrong", wrong, ""), ("Missed", missed_, "missed")):
+                    if rows.empty:
+                        continue
+                    h.append(f"<h4>{label} ({len(rows)})</h4>")
+                    for _, r in rows.head(max_cases).iterrows():
+                        why = r.get("note") or ""
+                        reason = r.get("reasoning") or ""
+                        h.append(f"<div class='case {cls}'><b>{_e(r['test_id'])}</b>"
+                                 f"<div class='row2'><div class='box'><b>Expected</b>{_e(r['expected']) or '<i>(blank)</i>'}</div>"
+                                 f"<div class='box'><b>Bolna extracted</b>{_e(r['predicted']) or '<i>(nothing)</i>'}</div></div>"
+                                 f"<div class='why'><b>Why:</b> {_e(why)}</div>"
+                                 + (f"<div class='why'><b>Bolna's reasoning:</b> {_e(reason)}</div>" if reason else "")
+                                 + f"<details><summary class='mute'>📄 Transcript</summary>{_chat(r.get('transcript', ''))}</details></div>")
+                    if len(rows) > max_cases:
+                        h.append(f"<div class='mute'>…and {len(rows) - max_cases} more (see the Excel report).</div>")
+                h.append("</div></details>")
+
+    if len(failed):
+        h.append("<h2>Failed requests</h2><table><tr><th>test_id</th><th>HTTP</th><th>error</th></tr>"
+                 + "".join(f"<tr><td>{_e(r['test_id'])}</td><td>{_e(r['http_status'])}</td><td>{_e(str(r['error'])[:200])}</td></tr>"
+                           for _, r in failed.iterrows()) + "</table>")
+    h.append("<p class='mute' style='margin-top:40px'>Generated by Bolna Extraction Tester.</p></div></body></html>")
+    return "".join(h)
 
 
 # ------------------------------------------------------------------ CLI ----

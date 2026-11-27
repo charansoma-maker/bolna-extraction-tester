@@ -55,12 +55,19 @@ Uses an offline keyword-based fake that returns the documented response shape.
 - Each extraction is compared by its Bolna answer type (read from the response):
   Objective → exact · Timestamp → same date (and time, if the expected value has one) · Numeric → same number ·
   Boolean / Email / Custom regex → exact. Plain **Text** extractions are not scored.
-- `expected::<name>` must match the Bolna extraction name exactly. The UI lists every extraction the agent returned.
+- `expected::<name>` must match the Bolna extraction name exactly (if no column has the prefix, every column
+  except test_id / transcript / call_date is treated as expected). The UI lists every extraction the agent returned.
+- Include `call_date` (the original call's date/time) or relative dates resolve from the day you run the test.
+- `skipped` / `parent_mismatch` is normal: follow-up extractions only run when `call_disposition` matches them.
 
 ## UI
-Upload → live progress per call → results with accuracy per disposition, grouped by category.
+Upload → checks (missing `call_date`, wrong transcript format, no expected columns) → optional
+"Test 1 call first" (confirms your column names match the agent) → run → results.
+Runs execute in a background thread on the server: closing the tab or a sleeping laptop doesn't stop them,
+and reopening the app reattaches to the live progress. Interrupted runs can be resumed and failed calls retried;
+both only call what's missing. Times are shown in IST.
 Open a disposition to see each test case, its transcript, expected vs extracted, and why it didn't match.
-Downloads: Excel report, Bolna output (CSV), raw responses (JSONL). Saved runs reopen from the sidebar.
+Downloads: dashboard report (single HTML file to share), Excel report, Bolna output (CSV), raw responses (JSONL). Saved runs reopen from the sidebar.
 
 ## Notes
 - Response shape confirmed against Bolna docs: `extracted_data.{category}.{name}.{subjective, objective, status, status_reason, validation}`.
